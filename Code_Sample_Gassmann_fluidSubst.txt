@@ -1,0 +1,263 @@
+
+# -*- coding: utf-8 -*-
+"""
+Created on Sun Nov  8 22:23:35 2020
+The code is structured as:
+    I. load data, perform relevant QC, and add rock properties
+        (1) load density and bulk modulus for minerals
+        (2) load data and change data type for appropriate columns
+        (3) separate fluid properties
+        (4) check that volume fractions are admissible
+        
+    II. Define functions used later in code
+    IIb. Perform fluid substition
+        Steps in performatin fluid substitution
+        (1)	Calculate K ang G for the in-situ conditions
+        (2)	Calculate K_0 based on lithology estimates
+        (3)	a) Calculate fluid properties K and rho 
+            b)  Mix fluids for the in-situ case according to S_w
+        (4)	Calculate K*
+        (5)	Calculate new fluid properties (K and rho) at the desired S_w
+        (6)	Calculate new saturated bulk modulus of the rock using Gassmann’s equation
+        (7)	Calculate new bulk density
+        (8)	Calculate new V_p and V_s
+    III. Run Fluid Substitution for 100% brine and make plots of the values.
+    IV. Run a loop of fluid substitution for a selected sample and plot Vp/Vs
+        on ternary plots.
+    V. Output results
+        (1) Graphically -- Use a subsample of the data plot a terniary plot with color
+        to represent vp and vs and for a grid of input breakdown by water, gas, and oil
+        (2) output a csv file of all data
+
+
+@author: kspir
+"""
+import pandas as pd
+import numpy as np
+
+#builing dataframe for mineral information
+mineral = ['kerogen','pyrite','calcite','dolomite','clay','quartz']
+rho_m = [1.3,4.93,2.712,2.87,2.78,2.649]
+K_m = [5.53,147,74.82,91.8,52.6,37.88]
+min_info = pd.DataFrame({'rho':rho_m,'K':K_m},index = mineral)
+
+#loading csv to build data frame of the seven shale formations
+
+data = pd.read_csv('data.csv')
+
+# data specific loading
+data = pd.read_csv('data.csv')
+units = data[0:1]
+data = data.drop(0)
+columns = list(data)
+numerical_col = columns[1:]
+mineral_fraction_columns = columns [4:10]
+data[numerical_col] = data[numerical_col].apply(pd.to_numeric, downcast='float',errors='coerce')
+fluid_col = columns[-4:]
+fluid_info = data[fluid_col]
+
+#check volume fractions within tolerance of sum of rock
+if data[mineral_fraction_columns].sum(axis = 1).min()<.99:
+    print('Error found in volume fraction of incoming data')
+    print(data[data[mineral_fraction_columns].sum(axis = 1)<.99].index)
+
+if data[mineral_fraction_columns].sum(axis = 1).min() > 1.01:
+    print('Error found in volume fraction of incoming data')
+    print(data[data[mineral_fraction_columns].sum(axis = 1)>1.01].index)
+    
+
+#functions used 
+def find_K_sat(rhob,vp,vs):
+    '''calculates the bulk modulus K as K = vp^2-4/3vs^2 from rho,vp and vs only'''
+    return rhob*(vp**2-4/3*vs**2)
+
+def find_mu(rhob,vs):
+    '''calculates shear modulus mu as mu = rho*vs^2 from rho and vs'''
+    return rhob*(vs**2)
+
+def find_rho_fl(sw,alt_fls=0,alt_rho=0,default=fluid_info):
+    '''uses weighted average of fluid components to find fluid density
+    alt_fls and alt_rho allows for the introduction of a third fluid'''
+    if (sw+alt_fls*np.ones(np.size(sw))).max() > 1:
+        raise ValueError
+    rhow = fluid_info['B_rho']
+    rhoh = fluid_info['H_rho']
+    rhoalt = alt_rho*np.ones(np.size(rhoh))
+    return sw*rhow+(1-sw-alt_fls)*rhoh+alt_fls*rhoalt
+
+def find_K_fl(sw,alt_fls=0,alt_k=1,defalut=fluid_info):
+    '''finds the bulk modulus of the fluid using a harmonic average'''
+    if (sw+alt_fls*np.ones(np.size(sw))).max() > 1:
+        raise ValueError
+    kw = fluid_info['B_K']
+    kh = fluid_info['H_K']
+    kalt = alt_k*np.ones(np.size(kh))
+    return 1/(sw/kw+(1-sw-alt_fls)/kh+alt_fls/kalt)
+
+def K_reuss(xi,default=min_info):
+    '''Reuss bound for bulk modulus of the rock matrix -- harmonic average'''
+    ki = min_info['K']
+    return 1/np.divide(xi,ki).sum(axis=1)
+
+def K_voight(xi,efault=min_info):
+    '''Voigt bound for the bulk modulus of the rock matrix -- arithmetic average
+    accuracy relies on order of the elements'''
+    ki = min_info['K']
+    return np.multiply(xi,ki).sum(axis=1)
+
+def find_rho_matrix(vol_frac,default=min_info):
+    '''Arithmetic Average of density based on volume fraction --
+    accuracy relies on order of the constituents '''
+    rho_mineral = min_info['rho'].to_numpy()
+    weighted_parts = np.multiply(vol_frac,rho_mineral)
+    return np.sum(weighted_parts,axis=1)
+
+def find_rho_bulk(rho_matrix,rho_fl,porosity):
+    '''weighted average of the matrix and fluid densities '''
+    return rho_fl*porosity+(1-porosity)*rho_matrix
+
+def find_K_drained_rock(Ksat,porosity,Kmin,Kfluid):
+    '''gassmann's equation solved for the bulk modulus of drained rock'''
+    numerator = np.multiply(Ksat,porosity*Kmin/Kfluid)+1-porosity
+    denominator = porosity*Kmin/Kfluid+Ksat/Kmin-1-porosity
+    return np.divide(numerator,denominator)
+
+def find_K_sat_new(Kdrained,porosity,Kmin,Kfluid):
+    '''gassmann's equation solved for K sat '''
+    numerator=np.multiply(1-Kdrained/Kmin, 1-Kdrained/Kmin)
+    denominator = porosity/Kfluid+(1-porosity)/Kmin-Kdrained/np.multiply(Kmin,Kmin)
+    return Kdrained+numerator/denominator
+
+def new_vp_vs(Ksat,mu_sat,rhob):
+    '''Returns Vp and Vs based on bulk modulus of saturated rock, bulk density
+    and shear modulus (assumed to be independent of fluid)'''
+    return np.sqrt(np.divide(Ksat+4/3*mu_sat,rhob)),np.sqrt(np.divide(mu_sat,rhob))
+
+def fluid_subst(rhob,vp,vs,vol_frac,sw,por,rho_brine,K_brine,rho_hydro,K_hydro,new_sw,alt_sw=0,alt_k=1,alt_rho=1):
+    K_sat_insitu = find_K_sat(rhob,vp,vs)
+    mu_sat_insitu = find_mu(rhob,vs)
+    rho_mineral = find_rho_matrix(vol_frac)
+    K_fluid_insitu = find_K_fl(sw)
+    K_reuss_min = K_reuss(vol_frac)
+    K_voight_min = K_voight(vol_frac)
+    K_min = .5*K_reuss_min + .5*K_voight_min
+    K_drained = find_K_drained_rock(K_sat_insitu,por,K_min,K_fluid_insitu)
+    alt_fl_sw = new_sw*np.ones(np.size(sw))
+    #altb is for the introduction of a third fluid in the pore space
+    altb_sw = alt_sw*np.ones(np.size(sw))
+    altb_k = alt_k*np.ones(np.size(sw))
+    altb_rho = alt_rho*np.ones(np.size(sw))
+    alt_fl_rho = find_rho_fl(alt_fl_sw,altb_sw,altb_rho)
+    alt_fl_K = find_K_fl(new_sw,altb_sw,altb_k)
+    alt_Ksat = find_K_sat_new(K_drained, por, K_min, alt_fl_K)
+    alt_rhob = find_rho_bulk(rho_mineral,alt_fl_rho,por)
+    return new_vp_vs(alt_Ksat,mu_sat_insitu,alt_rhob)
+    
+    
+    
+vp_new,vs_new = fluid_subst(data['RHOB'],data['Vp'],data['Vs'],data[mineral_fraction_columns],
+                            data['SwT'],data['PhiT'],data['B_rho'],data['B_K'],data['H_rho'],data['H_K'],1)  
+    
+
+vp_new_fizz,vs_new_fizz = fluid_subst(data['RHOB'],data['Vp'],data['Vs'],data[mineral_fraction_columns],
+                            data['SwT'],data['PhiT'],data['B_rho'],data['B_K'],data['H_rho'],data['H_K'],.6,.05,.05,.13)
+
+vp_new_60,vs_new_60 = fluid_subst(data['RHOB'],data['Vp'],data['Vs'],data[mineral_fraction_columns],
+                            data['SwT'],data['PhiT'],data['B_rho'],data['B_K'],data['H_rho'],data['H_K'],.6,.05,.02,.13) 
+
+#plot brine saturated and oil with a little gass curves
+
+import matplotlib.pyplot as plt
+
+depths = np.arange(2033)
+plt.plot(depths,vp_new,label = '100% brine')
+#plt.plot(depths,vp_new_fizz)
+plt.plot(depths,data['Vp'],label = 'insitu')
+plt.xlabel('sample number')
+plt.ylabel('V_p in km/s')
+plt.title('Comparing Vp insitu with Vp 100% brine')
+plt.legend()
+plt.show()
+
+plt.plot(depths,vp_new,"-r",label = '100% brine')
+#plt.plot(depths,vp_new_fizz,"-g", label = '5% gas')
+plt.plot(depths,data['Vp'], label = 'insitu')
+plt.xlabel('sample number')
+plt.ylabel('V_p in km/s')
+plt.title('Comparing Vp insitu with Vp Brine close-up')
+plt.xlim([100,300])
+plt.legend()
+plt.show()
+
+#plt.plot(depths,vp_new)
+plt.plot(depths,vp_new_fizz, label = 'Fizz')
+plt.plot(depths,data['Vp'], label = 'insitu')
+plt.xlabel('sample number')
+plt.ylabel('V_p in km/s')
+plt.title('Comparing Vp insitu with Vp 40% brine 5% gas')
+plt.xlim([1100,1300])
+plt.legend()
+plt.show()
+
+plt.plot(depths,vs_new,'-r',label='vs with 100% brine')
+#plt.plot(depths,vs_new_fizz)
+plt.plot(depths,data['Vs'],'-b',label='vs insitu')
+plt.xlabel('sample number')
+plt.ylabel('Vs in km/s')
+plt.title('Comparing plots of Vs insitu with Vs 100% brine')
+plt.legend()
+plt.show()
+
+plt.plot(depths,vs_new, label = '100% brine')
+#plt.plot(depths,vs_new_fizz)
+plt.plot(depths,data['Vs'], label = "insitu")
+plt.xlabel('sample number')
+plt.ylabel('Vs in km/s')
+plt.title('Comparing plots of Vs insitu with Vs 100% brine')
+plt.xlim([100,300])
+plt.ylim([2,2.6])
+plt.legend()
+plt.show()
+
+
+
+# running a sample thorugh various options
+
+data1 = data[1848:1849]
+fluid_info = fluid_info[1848:1849]
+
+columns = ['brine','oil','gas','Vp','Vs']
+
+vpvs1 = pd.DataFrame(data=np.empty([66,5]),columns=columns)
+
+
+counter = 0
+for i in range(11):
+    brine = i/10
+    for j in range(11-i):
+        gas = j/10
+        vp,vs = fluid_subst(data1['RHOB'],data1['Vp'],data1['Vs'],data1[mineral_fraction_columns],
+                            data1['SwT'],data1['PhiT'],data1['B_rho'],data1['B_K'],data1['H_rho'],
+                            data1['H_K'],brine,gas,.25,.13)
+        oil = round(1 - brine - gas,2)
+        vpvs1.iloc[counter]=[brine,oil,gas,round(vp,3),round(vs,3)]
+        counter = counter+1
+    
+#ternary plot
+#I admit I ran this portion of the code in a jupyter notebook because I could not get the 
+#plots to appear in the plot window
+import plotly.express as px
+
+plot = px.scatter_ternary(vpvs1, a = 'brine', b = 'oil', c = 'gas', color = 'Vp')
+plot.show()
+plot = px.scatter_ternary(vpvs1, a = 'brine', b = 'oil', c = 'gas', color = 'Vs')
+plot.show()
+
+
+
+
+
+
+
+
+

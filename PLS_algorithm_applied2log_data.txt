@@ -1,0 +1,292 @@
+
+# -*- coding: utf-8 -*-
+"""
+Created on Sun Nov  8 22:23:35 2020
+The code is structured as follows with I-IIb the same as planB
+    I. load data, perform relevant QC, and add rock properties
+        (1) load density and bulk modulus for minerals
+        (2) load data and change data type for appropriate columns
+        (3) separate fluid properties
+        (4) check that volume fractions are admissible  
+    II. Define functions used later in code
+    IIb. Perform fluid substition
+        Steps in performatin fluid substitution
+        (1)	Calculate K ang G for the in-situ conditions
+        (2)	Calculate K_0 based on lithology estimates
+        (3)	a) Calculate fluid properties K and rho 
+            b)  Mix fluids for the in-situ case according to S_w
+        (4)	Calculate K*
+        (5)	Calculate new fluid properties (K and rho) at the desired S_w
+        (6)	Calculate new saturated bulk modulus of the rock using Gassmann’s equation
+        (7)	Calculate new bulk density
+        (8)	Calculate new V_p and V_s
+    III. Run Fluid Substitution for all samples in a loop in order to generate
+        more data points for a regression.
+    IV. Create a test/train split and perform a Partial Least Squares regression
+    V. Output results
+        (1) Graphically -- Use a subsample of the data plot a terniary plot with color
+        to represent vp and vs and for a grid of input breakdown by water, gas, and oil
+        (2) data table
+        
+
+@author: kspir
+"""
+import pandas as pd
+import numpy as np
+
+#builing dataframe for mineral information
+mineral = ['kerogen','pyrite','calcite','dolomite','clay','quartz']
+rho_m = [1.3,4.93,2.712,2.87,2.78,2.649]
+K_m = [5.53,147,74.82,91.8,52.6,37.88]
+min_info = pd.DataFrame({'rho':rho_m,'K':K_m},index = mineral)
+
+#loading csv to build data frame of the seven shale formations
+
+data = pd.read_csv('data.csv')
+
+# data specific loading
+data = pd.read_csv('data.csv')
+units = data[0:1]
+data = data.drop(0)
+columns = list(data)
+numerical_col = columns[1:]
+mineral_fraction_columns = columns [4:10]
+data[numerical_col] = data[numerical_col].apply(pd.to_numeric, downcast='float',errors='coerce')
+fluid_col = columns[-4:]
+fluid_info = data[fluid_col]
+
+#check volume fractions within tolerance of sum of rock
+if data[mineral_fraction_columns].sum(axis = 1).min()<.99:
+    print('Error found in volume fraction of incoming data')
+    print(data[data[mineral_fraction_columns].sum(axis = 1)<.99].index)
+
+if data[mineral_fraction_columns].sum(axis = 1).min() > 1.01:
+    print('Error found in volume fraction of incoming data')
+    print(data[data[mineral_fraction_columns].sum(axis = 1)>1.01].index)
+
+#functions used 
+def find_K_sat(rhob,vp,vs):
+    '''calculates the bulk modulus K as K = vp^2-4/3vs^2 from rho,vp and vs only'''
+    return rhob*(vp**2-4/3*vs**2)
+
+def find_mu(rhob,vs):
+    '''calculates shear modulus mu as mu = rho*vs^2 from rho and vs'''
+    return rhob*(vs**2)
+
+def find_rho_fl(sw,alt_fls=0,alt_rho=0,default=fluid_info):
+    '''uses weighted average of fluid components to find fluid density
+    alt_fls and alt_rho allows for the introduction of a third fluid'''
+    if (sw+alt_fls*np.ones(np.size(sw))).max() > 1:
+        raise ValueError
+    rhow = fluid_info['B_rho']
+    rhoh = fluid_info['H_rho']
+    rhoalt = alt_rho*np.ones(np.size(rhoh))
+    return sw*rhow+(1-sw-alt_fls)*rhoh+alt_fls*rhoalt
+
+def find_K_fl(sw,alt_fls=0,alt_k=1,defalut=fluid_info):
+    '''finds the bulk modulus of the fluid using a harmonic average'''
+    if (sw+alt_fls*np.ones(np.size(sw))).max() > 1:
+        raise ValueError
+    kw = fluid_info['B_K']
+    kh = fluid_info['H_K']
+    kalt = alt_k*np.ones(np.size(kh))
+    return 1/(sw/kw+(1-sw-alt_fls)/kh+alt_fls/kalt)
+
+def K_reuss(xi,default=min_info):
+    '''Reuss bound for bulk modulus of the rock matrix -- harmonic average'''
+    ki = min_info['K']
+    return 1/np.divide(xi,ki).sum(axis=1)
+
+def K_voight(xi,efault=min_info):
+    '''Voigt bound for the bulk modulus of the rock matrix -- arithmetic average
+    accuracy relies on order of the elements'''
+    ki = min_info['K']
+    return np.multiply(xi,ki).sum(axis=1)
+
+def find_rho_matrix(vol_frac,default=min_info):
+    '''Arithmetic Average of density based on volume fraction --
+    accuracy relies on order of the constituents '''
+    rho_mineral = min_info['rho'].to_numpy()
+    weighted_parts = np.multiply(vol_frac,rho_mineral)
+    return np.sum(weighted_parts,axis=1)
+
+def find_rho_bulk(rho_matrix,rho_fl,porosity):
+    '''weighted average of the matrix and fluid densities '''
+    return rho_fl*porosity+(1-porosity)*rho_matrix
+
+def find_K_drained_rock(Ksat,porosity,Kmin,Kfluid):
+    '''gassmann's equation solved for the bulk modulus of drained rock'''
+    numerator = np.multiply(Ksat,porosity*Kmin/Kfluid)+1-porosity
+    denominator = porosity*Kmin/Kfluid+Ksat/Kmin-1-porosity
+    return np.divide(numerator,denominator)
+
+def find_K_sat_new(Kdrained,porosity,Kmin,Kfluid):
+    '''gassmann's equation solved for K sat '''
+    numerator=np.multiply(1-Kdrained/Kmin, 1-Kdrained/Kmin)
+    denominator = porosity/Kfluid+(1-porosity)/Kmin-Kdrained/np.multiply(Kmin,Kmin)
+    return Kdrained+numerator/denominator
+
+def new_vp_vs(Ksat,mu_sat,rhob):
+    '''Returns Vp and Vs based on bulk modulus of saturated rock, bulk density
+    and shear modulus (assumed to be independent of fluid)'''
+    return np.sqrt(np.divide(Ksat+4/3*mu_sat,rhob)),np.sqrt(np.divide(mu_sat,rhob))
+
+def fluid_subst(rhob,vp,vs,vol_frac,sw,por,rho_brine,K_brine,rho_hydro,K_hydro,new_sw,alt_sw=0,alt_k=1,alt_rho=1):
+    K_sat_insitu = find_K_sat(rhob,vp,vs)
+    mu_sat_insitu = find_mu(rhob,vs)
+    rho_mineral = find_rho_matrix(vol_frac)
+    K_fluid_insitu = find_K_fl(sw)
+    K_reuss_min = K_reuss(vol_frac)
+    K_voight_min = K_voight(vol_frac)
+    K_min = .5*K_reuss_min + .5*K_voight_min
+    K_drained = find_K_drained_rock(K_sat_insitu,por,K_min,K_fluid_insitu)
+    alt_fl_sw = new_sw*np.ones(np.size(sw))
+    #altb is for the introduction of a third fluid in the pore space
+    altb_sw = alt_sw*np.ones(np.size(sw))
+    altb_k = alt_k*np.ones(np.size(sw))
+    altb_rho = alt_rho*np.ones(np.size(sw))
+    alt_fl_rho = find_rho_fl(alt_fl_sw,altb_sw,altb_rho)
+    alt_fl_K = find_K_fl(new_sw,altb_sw,altb_k)
+    alt_Ksat = find_K_sat_new(K_drained, por, K_min, alt_fl_K)
+    alt_rhob = find_rho_bulk(rho_mineral,alt_fl_rho,por)
+    return new_vp_vs(alt_Ksat,mu_sat_insitu,alt_rhob)
+    
+#decimation in water saturation
+d = .05
+# entries in final fluid substituted data set
+countermax = d*2033
+
+
+gcolumns = ['gSwT','gVp','gVs']
+
+gassmann = pd.DataFrame(data=np.empty([2033,3]),columns=gcolumns)
+gassmann[columns]=data[columns]
+gassmann0 = gassmann
+
+# counter = 0
+for i in range(int(1/d)+1):
+    brine = i*d
+    vp,vs = fluid_subst(data['RHOB'],data['Vp'],data['Vs'],data[mineral_fraction_columns],
+                        data['SwT'],data['PhiT'],data['B_rho'],data['B_K'],data['H_rho'],
+                        data['H_K'],brine)
+    gassmann[gcolumns]=[brine,round(vp,3),round(vs,3)]
+    gassmann0=gassmann0.append(gassmann,ignore_index=True)
+    
+#columns I wnat to learn from
+lcolumns =  ['gSwT','gVp','RHOB','XTOC','Xpyrite','Xcalcite','Xdolomite','Xclay','Xquartz','PhiT','RhoG','TOC (wt%)','H_K','H_rho','B_K','B_rho']
+
+#target column
+tcolumn = ['gVs']
+
+import matplotlib.pyplot as plt 
+from sklearn.cross_decomposition import PLSRegression 
+from sklearn.model_selection import train_test_split 
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.metrics import mean_absolute_error
+# #model selection is only used when finding optimal number principle components
+# from sklearn import model_selection
+
+
+#drop na values
+cgassmann = gassmann0.dropna()
+
+#define x and y variables, this makes it easy to reuse for other data sets
+df_x = cgassmann[lcolumns]
+df_y = cgassmann['gVs']
+
+x_train, x_test, y_train, y_test = train_test_split( 
+    df_x, df_y, test_size=0.30, random_state=1) 
+
+n = len(x_train)
+
+
+# #This commented out code was used to find the optimal number of principle components
+# which is 6
+# #10-fold CV, with shuffle
+# kf_10 = model_selection.KFold(n_splits=10, shuffle=True, random_state=1)
+# #score = model_selection.cross_val_score(pls, scale(x_train), y_train, cv=kf_10, scoring='neg_mean_squared_error').mean()
+# # print(score)
+# mse = []
+
+# for i in np.arange(1, 20):
+#     pls = PLSRegression(n_components=i)
+#     score = model_selection.cross_val_score(pls, x_train, y_train, cv=kf_10, scoring='neg_mean_squared_error').mean()
+#     mse.append(-score)
+
+# # Plot results
+# plt.plot(np.arange(1, 20), np.array(mse), '-v')
+# plt.xlabel('Number of principal components in regression')
+# plt.ylabel('MSE')
+# plt.title('K_phi PLS Compenent Test')
+# plt.xlim(xmin=-1)
+
+
+
+
+# create PLSRegression model 
+pls2 = PLSRegression(n_components=6) 
+ 
+# fit the model 
+pls2.fit(x_train, y_train) 
+  
+# predict the values 
+Y_pred = pls2.predict(df_x) 
+y_train_pred = pls2.predict(x_train)
+
+y_test_pred = pls2.predict(x_test)
+
+print('MSE train: %.3f, test: %.3f' % (mean_squared_error(y_train, y_train_pred),
+                mean_squared_error(y_test, y_test_pred)))
+
+print('R^2 train: %.3f, test: %.3f' % (r2_score(y_train, y_train_pred),
+                r2_score(y_test, y_test_pred)))
+ 
+print('Mean Absolute: %.3f, test: %.3f' % (mean_absolute_error(y_train, y_train_pred),mean_absolute_error(y_test, y_test_pred))) 
+
+
+
+pls3 = PLSRegression(n_components=6) 
+
+  
+#apply regression to original data and compare to vs
+
+#prep columns
+data2 = data
+data2['gSwT'] = data['SwT']
+data2['gVp'] = data['Vp']
+
+df_x = data2[lcolumns]
+df_y = data2['Vs']
+
+df_ypred = pls2.predict(df_x)
+
+plt.plot(df_ypred,'-b',label='predicted vs ')
+plt.plot(df_y,'-r',label = 'original vs')
+plt.legend()
+plt.show()
+
+plt.plot(df_ypred,'-b',label='predicted vs')
+plt.plot(df_y,'-r',label = 'original vs')
+plt.legend()
+plt.xlim([100,300])
+plt.show()
+
+diff = df_ypred.reshape(2033)-df_y.to_numpy()
+
+plt.plot(diff)
+plt.title('absolute error in good area')
+plt.xlim([100,200])
+plt.show()
+
+plt.plot(diff)
+plt.title('absolute error in area for future research')
+plt.xlim([1750,1950])
+plt.show()
+
+print('MSE train: %.3f, original: %.3f' % (mean_squared_error(y_train, y_train_pred),
+                mean_squared_error(df_y, df_ypred)))
+
+print('R^2 train: %.3f, original: %.3f' % (r2_score(y_train, y_train_pred),
+                r2_score(df_y, df_ypred)))
+ 
+print('Mean Absolute: %.3f, original: %.3f' % (mean_absolute_error(y_train, y_train_pred),mean_absolute_error(df_y, df_ypred))) 
